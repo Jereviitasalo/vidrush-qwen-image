@@ -111,6 +111,40 @@ def to_fp8(pipe):
         return 'bf16'
 
 
+def linear_patch_embed(pipe):
+    """Run the vision tower's patch embedding as a matmul instead of Conv3d.
+
+    torch 2.9's bf16 Conv3d is pathologically slow with its bundled cuDNN
+    (pytorch/pytorch#174051): it took ~5.5 s of a 512 px reference job's
+    ~9 s. The kernel equals the stride, so each patch is one dot product with
+    the flattened kernel, and a linear layer on the flattened patches is the
+    same computation (ComfyUI does the same for Qwen VL).
+    """
+    visual = getattr(getattr(pipe.text_encoder, 'model', None), 'visual', None)
+    embed = getattr(visual, 'patch_embed', None)
+    conv = getattr(embed, 'proj', None)
+    if not isinstance(conv, torch.nn.Conv3d) or tuple(conv.kernel_size) != tuple(conv.stride) or any(conv.padding):
+        print('[qwen-image] vision patch embed is not a plain Conv3d; left as is', flush=True)
+        return False
+    weight = conv.weight.detach().reshape(conv.out_channels, -1)
+    bias = None if conv.bias is None else conv.bias.detach()
+
+    def forward(hidden_states):
+        flat = hidden_states.to(weight.dtype).reshape(-1, weight.shape[1])
+        return torch.nn.functional.linear(flat, weight, bias)
+
+    # Same numbers as the convolution on a few random patches, or keep the convolution.
+    with torch.no_grad():
+        sample = torch.randn(8, weight.shape[1], device=weight.device, dtype=weight.dtype)
+        expected, actual = embed(sample).float(), forward(sample).float()
+    error = ((expected - actual).abs().max() / expected.abs().max().clamp_min(1e-6)).item()
+    if error > 1e-2:
+        print(f'[qwen-image] linear patch embed differs from Conv3d (rel. error {error:.2e}); left as is', flush=True)
+        return False
+    embed.forward = forward
+    return True
+
+
 def load_pipeline():
     from diffusers import QwenImage21Pipeline
 
@@ -120,6 +154,7 @@ def load_pipeline():
     vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
     if vram_gb >= RESIDENT_MIN_VRAM_GB:
         pipe.to('cuda')
+        linear_patch_embed(pipe)
         precision = to_fp8(pipe)
         placement = 'resident'
     else:
