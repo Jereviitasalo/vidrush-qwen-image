@@ -38,13 +38,10 @@ MODEL_REVISION = os.environ.get('QWEN_MODEL_REVISION', '790c92633540aa0cb11d9abf
 RUNPOD_CACHE = Path('/runpod-volume/huggingface-cache/hub')
 # Every weight resident in bf16 needs ~34-40 GB at 1 MP; smaller cards offload.
 RESIDENT_MIN_VRAM_GB = 40
-# A second transformer in FP8 (weights and activations) draws text-to-image
-# plates on Ada/Hopper/Blackwell tensor cores, ~1.4x faster at the same look.
-# Condition images come out posterized under FP8, so any job with references
-# runs on the bf16 transformer. Ampere has no FP8 and stays bf16 throughout.
-# Two transformers and a bf16 text encoder do not fit 48 GB, so the text
-# encoder (17.5 GB, one forward per plate) keeps FP8 weights with bf16
-# activations. QWEN_FP8=0 turns both off.
+# FP8 transformer (weights and activations) on Ada/Hopper/Blackwell tensor
+# cores: ~1.4x faster at the same look, with or without condition images
+# (a posterized copy of the reference comes from reusing the reference's own
+# seed, not from FP8). Ampere has no FP8 and stays bf16. QWEN_FP8=0 turns it off.
 FP8 = os.environ.get('QWEN_FP8', '1') == '1'
 
 MAX_REFERENCES = 10
@@ -68,23 +65,19 @@ def snapshot_path():
     return snapshot_download(MODEL_REPO, revision=MODEL_REVISION), 'download'
 
 
-def fp8_transformer(pipe, path):
-    """FP8 text-encoder weights, then a second FP8 copy of the transformer quantized layer by layer onto the GPU; None when the card or torchao cannot."""
+def to_fp8(pipe):
+    """Quantize the transformer's linear layers to FP8, or leave bf16 when the card or torchao cannot."""
     if not FP8 or torch.cuda.get_device_capability(0) < (8, 9):
-        return None
+        return 'bf16'
     try:
-        from diffusers import QwenImage21Transformer2DModel
-        from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, Float8WeightOnlyConfig, PerRow, quantize_
+        from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, PerRow, quantize_
 
-        quantize_(pipe.text_encoder, Float8WeightOnlyConfig())
+        quantize_(pipe.transformer, Float8DynamicActivationFloat8WeightConfig(granularity=PerRow()))
         torch.cuda.empty_cache()
-        model = QwenImage21Transformer2DModel.from_pretrained(path, subfolder='transformer', dtype=torch.bfloat16)
-        quantize_(model, Float8DynamicActivationFloat8WeightConfig(granularity=PerRow()), device='cuda')
-        return model.to('cuda').eval()
+        return 'fp8'
     except Exception as error:  # keep serving in bf16 rather than failing the worker
         print(f'[qwen-image] FP8 unavailable, staying bf16: {error}', flush=True)
-        torch.cuda.empty_cache()
-        return None
+        return 'bf16'
 
 
 def load_pipeline():
@@ -94,25 +87,25 @@ def load_pipeline():
     path, source = snapshot_path()
     pipe = QwenImage21Pipeline.from_pretrained(path, dtype=torch.bfloat16)
     vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
-    fp8 = None
     if vram_gb >= RESIDENT_MIN_VRAM_GB:
         pipe.to('cuda')
-        fp8 = fp8_transformer(pipe, path)
+        precision = to_fp8(pipe)
         placement = 'resident'
     else:
         pipe.enable_model_cpu_offload()
-        placement = 'offload'
+        precision, placement = 'bf16', 'offload'
     pipe.set_progress_bar_config(disable=True)
-    return pipe, {'bf16': pipe.transformer, 'fp8': fp8}, {
+    return pipe, {
         'loadSeconds': round(time.time() - started, 2),
         'source': source,
         'placement': placement,
+        'precision': precision,
         'revision': Path(path).name,
         'freeVramGb': round(torch.cuda.mem_get_info()[0] / 1024**3, 1),
     }
 
 
-PIPE, TRANSFORMERS, LOAD = load_pipeline()
+PIPE, LOAD = load_pipeline()
 GPU = torch.cuda.get_device_name(0)
 COLD = {'pending': True}
 print(f'[qwen-image] ready on {GPU}: {LOAD}', flush=True)
@@ -186,8 +179,6 @@ def handler(job):
     except BadRequest as error:
         return {'error': f'bad request: {error}'}
     started = time.time()
-    precision = 'fp8' if TRANSFORMERS['fp8'] is not None and not request['references'] else 'bf16'
-    PIPE.transformer = TRANSFORMERS[precision]
     generator = torch.Generator(device='cuda').manual_seed(request['seed'])
     # no_grad, not inference_mode: torchao's FP8 tensors cannot take inference tensors.
     try:
@@ -226,7 +217,7 @@ def handler(job):
         },
         'gpu': GPU,
         'placement': LOAD['placement'],
-        'precision': precision,
+        'precision': LOAD['precision'],
         'freeVramGb': LOAD['freeVramGb'],
         'model': {'repo': MODEL_REPO, 'revision': LOAD['revision'], 'source': LOAD['source']},
     }
