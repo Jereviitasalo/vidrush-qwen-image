@@ -174,7 +174,8 @@ def handler(job):
         return {'error': f'bad request: {error}'}
     started = time.time()
     generator = torch.Generator(device='cuda').manual_seed(request['seed'])
-    with torch.inference_mode():
+    # no_grad, not inference_mode: torchao's FP8 tensors cannot take inference tensors.
+    with torch.no_grad():
         image = PIPE(
             prompt=request['prompt'],
             image=request['references'] or None,
