@@ -34,6 +34,9 @@ MODEL_REVISION = os.environ.get('QWEN_MODEL_REVISION', '790c92633540aa0cb11d9abf
 RUNPOD_CACHE = Path('/runpod-volume/huggingface-cache/hub')
 # Every weight resident in bf16 needs ~34-40 GB at 1 MP; smaller cards offload.
 RESIDENT_MIN_VRAM_GB = 40
+# FP8 transformer (weights and activations) on Ada/Hopper/Blackwell tensor
+# cores; Ampere has none and stays bf16. QWEN_FP8=0 turns it off.
+FP8 = os.environ.get('QWEN_FP8', '1') == '1'
 
 MAX_REFERENCES = 10
 MAX_PIXELS = 4_194_304  # 2048 x 2048
@@ -56,6 +59,20 @@ def snapshot_path():
     return snapshot_download(MODEL_REPO, revision=MODEL_REVISION), 'download'
 
 
+def to_fp8(pipe):
+    """Quantize the transformer's linear layers to FP8, or leave bf16 when the card or torchao cannot."""
+    if not FP8 or torch.cuda.get_device_capability(0) < (8, 9):
+        return 'bf16'
+    try:
+        from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, PerRow, quantize_
+
+        quantize_(pipe.transformer, Float8DynamicActivationFloat8WeightConfig(granularity=PerRow()))
+        return 'fp8'
+    except Exception as error:  # keep serving in bf16 rather than failing the worker
+        print(f'[qwen-image] FP8 unavailable, staying bf16: {error}', flush=True)
+        return 'bf16'
+
+
 def load_pipeline():
     from diffusers import QwenImage21Pipeline
 
@@ -65,7 +82,7 @@ def load_pipeline():
     vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
     if vram_gb >= RESIDENT_MIN_VRAM_GB:
         pipe.to('cuda')
-        placement = 'resident'
+        placement = 'resident-' + to_fp8(pipe)
     else:
         pipe.enable_model_cpu_offload()
         placement = 'offload'

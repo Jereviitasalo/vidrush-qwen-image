@@ -14,7 +14,7 @@ RUN pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.9.1 
 
 COPY requirements.txt /worker/requirements.txt
 RUN pip install -r /worker/requirements.txt \
-    && python -c "from diffusers import QwenImage21Pipeline; from transformers import Qwen3VLForConditionalGeneration; import runpod"
+    && python -c "from diffusers import QwenImage21Pipeline; from transformers import Qwen3VLForConditionalGeneration; import runpod; from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, PerRow, quantize_"
 
 COPY handler.py /worker/handler.py
 WORKDIR /worker
