@@ -27,6 +27,7 @@ Reply: the JPEG as base64 plus timings and the GPU, so the app can price the
 job from RunPod's execution time.
 """
 import base64
+import dataclasses
 import gc
 import io
 import os
@@ -145,6 +146,59 @@ def lora_file(spec):
     return hf_hub_download(spec['repo'], spec['file'], revision=spec['revision'])
 
 
+def load_lora(name, path):
+    """load_lora_weights, minus the adapter-config fields this peft does not know.
+
+    A LoRA saved by a newer peft embeds its whole LoraConfig (Pruna's carries
+    peft 0.20 fields such as `lora_ga_config`), and LoraConfig refuses unknown
+    keywords. Those fields are all unset for a plain LoRA; `r` and
+    `lora_alpha` (Pruna: 64 and 128) are kept, so the fused scale stays right.
+    """
+    from peft import LoraConfig
+
+    state_dict, metadata = PIPE.lora_state_dict(str(path.parent), weight_name=path.name, return_lora_metadata=True)
+    if metadata:
+        known = {field.name for field in dataclasses.fields(LoraConfig)}
+        metadata = {key: value for key, value in metadata.items() if key.split('.', 1)[-1] in known}
+    PIPE.load_lora_into_transformer(state_dict, transformer=PIPE.transformer, adapter_name=name, metadata=metadata or None, _pipeline=PIPE)
+
+
+def instrument():
+    """Time the pipeline's stages (GPU-synchronised) into STAGES for the reply."""
+    def wrap(owner, attr, key):
+        inner = getattr(owner, attr)
+        if getattr(inner, '_qwen_timed', False):
+            return
+
+        def timed(*args, **kwargs):
+            torch.cuda.synchronize()
+            started = time.time()
+            try:
+                return inner(*args, **kwargs)
+            finally:
+                torch.cuda.synchronize()
+                STAGES.setdefault(key, []).append(round(time.time() - started, 3))
+
+        timed._qwen_timed = True
+        setattr(owner, attr, timed)
+
+    wrap(PIPE, 'encode_prompt', 'encode')
+    wrap(PIPE, 'prepare_latents', 'latents')
+    wrap(PIPE.transformer, 'forward', 'transformer')
+    wrap(PIPE.vae, 'decode', 'decode')
+
+
+def stage_timings():
+    steps = STAGES.get('transformer', [])
+    return {
+        'encode': round(sum(STAGES.get('encode', [])), 2),
+        'latents': round(sum(STAGES.get('latents', [])), 2),
+        'firstStep': steps[0] if steps else 0,
+        'otherSteps': round(sum(steps[1:]), 2),
+        'decode': round(sum(STAGES.get('decode', [])), 2),
+    }
+
+
 def use_variant(name):
     """Make `name` the resident transformer and scheduler; returns the seconds it took (0 when already resident)."""
     if STATE['variant'] == name:
@@ -163,14 +217,14 @@ def use_variant(name):
     transformer.to('cuda')
     spec = VARIANTS[name]
     if spec:
-        path = Path(lora_file(spec))
-        PIPE.load_lora_weights(str(path.parent), weight_name=path.name, adapter_name=name)
+        load_lora(name, Path(lora_file(spec)))
         PIPE.fuse_lora(lora_scale=1.0, adapter_names=[name])
         PIPE.unload_lora_weights()
     STATE['precision'] = to_fp8(PIPE)
     PIPE.scheduler = FlowMatchEulerDiscreteScheduler.from_config(BASE_SCHEDULER, **(spec or {}).get('scheduler', {}))
     gc.collect()
     torch.cuda.empty_cache()
+    instrument()
     STATE['variant'] = name
     seconds = round(time.time() - started, 2)
     print(f'[qwen-image] variant {name} ready in {seconds}s', flush=True)
@@ -184,6 +238,8 @@ class BadRequest(ValueError):
 PIPE, LOAD = load_pipeline()
 BASE_SCHEDULER = dict(PIPE.scheduler.config)
 STATE = {'variant': 'base', 'precision': LOAD['precision']}
+STAGES = {}
+instrument()
 if DEFAULT_VARIANT != 'base':
     LOAD['loadSeconds'] = round(LOAD['loadSeconds'] + use_variant(DEFAULT_VARIANT), 2)
 GPU = torch.cuda.get_device_name(0)
@@ -263,6 +319,7 @@ def handler(job):
     except BadRequest as error:
         return {'error': f'bad request: {error}'}
     spec = VARIANTS[request['variant']]
+    STAGES.clear()
     started = time.time()
     generator = torch.Generator(device='cuda').manual_seed(request['seed'])
     # no_grad, not inference_mode: torchao's FP8 tensors cannot take inference tensors.
@@ -301,6 +358,7 @@ def handler(job):
             'loadSeconds': LOAD['loadSeconds'],
             'coldStart': cold,
             'swapSeconds': swap_seconds,
+            'stages': stage_timings(),
             'generateSeconds': round(generate_seconds, 2),
         },
         'gpu': GPU,
