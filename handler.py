@@ -294,22 +294,49 @@ class BadRequest(ValueError):
     pass
 
 
-PIPE, LOAD = load_pipeline()
-BASE_SCHEDULER = dict(PIPE.scheduler.config)
-STATE = {'variant': 'base', 'precision': LOAD['precision']}
-RESIDENT = {'base': (PIPE.transformer, LOAD['precision'])}
+def start():
+    """Load the pipeline and build the preloaded variants; sets the module globals."""
+    global PIPE, LOAD, BASE_SCHEDULER, STATE, RESIDENT
+    PIPE, LOAD = load_pipeline()
+    BASE_SCHEDULER = dict(PIPE.scheduler.config)
+    STATE = {'variant': 'base', 'precision': LOAD['precision']}
+    RESIDENT = {'base': (PIPE.transformer, LOAD['precision'])}
+    instrument()
+    # Variants to build at start, beside base (the app mixes base and viggle-6).
+    # Only FP8 transformers are small enough to keep two; bf16 cards build on demand.
+    if LOAD['placement'] == 'resident' and LOAD['precision'] == 'fp8':
+        for preload in [v.strip() for v in os.environ.get('QWEN_PRELOAD', '').split(',') if v.strip()]:
+            if preload not in VARIANTS:
+                continue
+            try:
+                LOAD['loadSeconds'] = round(LOAD['loadSeconds'] + use_variant(preload), 2)
+            except Exception as error:  # keep serving base; the job that needs it retries the build
+                print(f'[qwen-image] preload {preload} failed: {error!r}', flush=True)
+                gc.collect()
+                torch.cuda.empty_cache()
+    if DEFAULT_VARIANT != STATE['variant'] and DEFAULT_VARIANT in VARIANTS:
+        LOAD['loadSeconds'] = round(LOAD['loadSeconds'] + use_variant(DEFAULT_VARIANT), 2)
+    LOAD['freeVramGb'] = round(torch.cuda.mem_get_info()[0] / 1024**3, 1)
+
+
 STAGES = {}
-instrument()
-# Variants to build at start, beside base (the app mixes base and viggle-6).
-for preload in [v.strip() for v in os.environ.get('QWEN_PRELOAD', '').split(',') if v.strip()]:
-    if preload in VARIANTS and LOAD['placement'] == 'resident':
-        LOAD['loadSeconds'] = round(LOAD['loadSeconds'] + use_variant(preload), 2)
-if DEFAULT_VARIANT != STATE['variant'] and DEFAULT_VARIANT in VARIANTS:
-    LOAD['loadSeconds'] = round(LOAD['loadSeconds'] + use_variant(DEFAULT_VARIANT), 2)
-LOAD['freeVramGb'] = round(torch.cuda.mem_get_info()[0] / 1024**3, 1)
-GPU = torch.cuda.get_device_name(0)
 COLD = {'pending': True}
-print(f'[qwen-image] ready on {GPU} with {STATE["variant"]}: {LOAD}', flush=True)
+try:
+    GPU = torch.cuda.get_device_name(0)
+except Exception as error:
+    GPU = f'unknown GPU ({error})'
+# A worker that cannot start still takes jobs and fails them at once with the
+# reason: a crash here would make RunPod restart it in a loop while the app's
+# job waits out its queue timeout.
+STARTUP_ERROR = None
+try:
+    start()
+    print(f'[qwen-image] ready on {GPU} with {STATE["variant"]}: {LOAD}', flush=True)
+except Exception:
+    import traceback
+
+    STARTUP_ERROR = traceback.format_exc()[-2500:]
+    print(f'[qwen-image] startup failed on {GPU}:\n{STARTUP_ERROR}', flush=True)
 
 
 def int_field(payload, key, default, low, high, multiple=1):
@@ -375,6 +402,8 @@ def parse(payload):
 
 
 def handler(job):
+    if STARTUP_ERROR:
+        return {'error': f'worker startup failed on {GPU}: {STARTUP_ERROR}'}
     try:
         request = parse(job.get('input'))
     except BadRequest as error:
