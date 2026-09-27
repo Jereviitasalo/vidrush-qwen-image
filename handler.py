@@ -306,6 +306,7 @@ def parse(payload):
         'references': [decode_reference(i, value) for i, value in enumerate(references)],
         'quality': int_field(payload, 'quality', 92, 70, 100),
         'reference_resolution': int_field(payload, 'reference_resolution', 512, 256, 1024, 32),
+        'profile': payload.get('profile') is True,
     }
 
 
@@ -323,6 +324,12 @@ def handler(job):
     started = time.time()
     generator = torch.Generator(device='cuda').manual_seed(request['seed'])
     # no_grad, not inference_mode: torchao's FP8 tensors cannot take inference tensors.
+    profiler = None
+    if request['profile']:
+        from torch.profiler import ProfilerActivity, profile
+
+        profiler = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True)
+        profiler.__enter__()
     try:
         with torch.no_grad():
             image = PIPE(
@@ -340,7 +347,17 @@ def handler(job):
         torch.cuda.empty_cache()
         refs = len(request['references'])
         return {'error': f"out of GPU memory at {request['width']}x{request['height']} with {refs} reference(s) on {GPU}"}
+    finally:
+        if profiler:
+            profiler.__exit__(None, None, None)
     generate_seconds = time.time() - started
+    profile_table = None
+    if profiler:
+        averages = profiler.key_averages(group_by_input_shape=True)
+        profile_table = {
+            'cpu': averages.table(sort_by='self_cpu_time_total', row_limit=30, max_name_column_width=70, max_shapes_column_width=60),
+            'cuda': averages.table(sort_by='self_cuda_time_total', row_limit=15, max_name_column_width=70, max_shapes_column_width=60),
+        }
     buffer = io.BytesIO()
     image.convert('RGB').save(buffer, format='JPEG', quality=request['quality'], optimize=True)
     cold = COLD.pop('pending', False)
@@ -366,6 +383,7 @@ def handler(job):
         'precision': STATE['precision'],
         'freeVramGb': LOAD['freeVramGb'],
         'model': {'repo': MODEL_REPO, 'revision': LOAD['revision'], 'source': LOAD['source']},
+        **({'profile': profile_table} if profile_table else {}),
     }
 
 
