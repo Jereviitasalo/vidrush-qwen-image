@@ -14,6 +14,10 @@ Request (`input`):
     steps       int, 8-60                        (default 40, Qwen's value)
     seed        int | null
     references  [base64 image], 0-10: condition images, read in order
+    reference_resolution  int, 256-1024 (default 512): side of the square
+                area each condition image is resized to. Condition tokens
+                join the sequence, so a 1 MP reference roughly quadruples a
+                1 MP draw; 512 keeps the look and subject at a fraction.
     quality     int, JPEG quality 70-100         (default 92)
 
 Reply: the JPEG as base64 plus timings and the GPU, so the app can price the
@@ -159,6 +163,7 @@ def parse(payload):
         'seed': seed,
         'references': [decode_reference(i, value) for i, value in enumerate(references)],
         'quality': int_field(payload, 'quality', 92, 70, 100),
+        'reference_resolution': int_field(payload, 'reference_resolution', 512, 256, 1024, 32),
     }
 
 
@@ -177,6 +182,8 @@ def handler(job):
             height=request['height'],
             num_inference_steps=request['steps'],
             generator=generator,
+            # Width and height are explicit, so this sizes the condition images only.
+            output_resolution=request['reference_resolution'],
         ).images[0]
     generate_seconds = time.time() - started
     buffer = io.BytesIO()

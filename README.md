@@ -11,7 +11,7 @@ The app creates the template and endpoint with the user's own RunPod API key (Se
 ## Request
 
 ```json
-{"input": {"version": 1, "prompt": "…", "width": 1344, "height": 768, "steps": 40, "seed": 7, "references": ["<base64 jpeg>"]}}
+{"input": {"version": 1, "prompt": "…", "width": 1344, "height": 768, "steps": 40, "seed": 7, "references": ["<base64 jpeg>"], "reference_resolution": 512}}
 ```
 
 The reply holds `image` (base64 JPEG), `width`, `height`, `seed`, `timings` (`loadSeconds`, `coldStart`, `generateSeconds`) and `gpu`.
