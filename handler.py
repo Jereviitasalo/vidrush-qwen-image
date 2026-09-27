@@ -38,8 +38,11 @@ MODEL_REVISION = os.environ.get('QWEN_MODEL_REVISION', '790c92633540aa0cb11d9abf
 RUNPOD_CACHE = Path('/runpod-volume/huggingface-cache/hub')
 # Every weight resident in bf16 needs ~34-40 GB at 1 MP; smaller cards offload.
 RESIDENT_MIN_VRAM_GB = 40
-# FP8 transformer (weights and activations) on Ada/Hopper/Blackwell tensor
-# cores; Ampere has none and stays bf16. QWEN_FP8=0 turns it off.
+# A second transformer in FP8 (weights and activations) draws text-to-image
+# plates on Ada/Hopper/Blackwell tensor cores, ~1.4x faster at the same look.
+# Condition images come out posterized under FP8, so any job with references
+# runs on the bf16 transformer. Ampere has no FP8 and stays bf16 throughout.
+# QWEN_FP8=0 turns the FP8 copy off.
 FP8 = os.environ.get('QWEN_FP8', '1') == '1'
 
 MAX_REFERENCES = 10
@@ -63,18 +66,21 @@ def snapshot_path():
     return snapshot_download(MODEL_REPO, revision=MODEL_REVISION), 'download'
 
 
-def to_fp8(pipe):
-    """Quantize the transformer's linear layers to FP8, or leave bf16 when the card or torchao cannot."""
+def fp8_transformer(path):
+    """A second, FP8 copy of the transformer, quantized layer by layer onto the GPU; None when the card or torchao cannot."""
     if not FP8 or torch.cuda.get_device_capability(0) < (8, 9):
-        return 'bf16'
+        return None
     try:
+        from diffusers import QwenImage21Transformer2DModel
         from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, PerRow, quantize_
 
-        quantize_(pipe.transformer, Float8DynamicActivationFloat8WeightConfig(granularity=PerRow()))
-        return 'fp8'
+        model = QwenImage21Transformer2DModel.from_pretrained(path, subfolder='transformer', dtype=torch.bfloat16)
+        quantize_(model, Float8DynamicActivationFloat8WeightConfig(granularity=PerRow()), device='cuda')
+        return model.to('cuda').eval()
     except Exception as error:  # keep serving in bf16 rather than failing the worker
         print(f'[qwen-image] FP8 unavailable, staying bf16: {error}', flush=True)
-        return 'bf16'
+        torch.cuda.empty_cache()
+        return None
 
 
 def load_pipeline():
@@ -84,22 +90,25 @@ def load_pipeline():
     path, source = snapshot_path()
     pipe = QwenImage21Pipeline.from_pretrained(path, dtype=torch.bfloat16)
     vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    fp8 = None
     if vram_gb >= RESIDENT_MIN_VRAM_GB:
         pipe.to('cuda')
-        placement = 'resident-' + to_fp8(pipe)
+        fp8 = fp8_transformer(path)
+        placement = 'resident'
     else:
         pipe.enable_model_cpu_offload()
         placement = 'offload'
     pipe.set_progress_bar_config(disable=True)
-    return pipe, {
+    return pipe, {'bf16': pipe.transformer, 'fp8': fp8}, {
         'loadSeconds': round(time.time() - started, 2),
         'source': source,
         'placement': placement,
         'revision': Path(path).name,
+        'freeVramGb': round(torch.cuda.mem_get_info()[0] / 1024**3, 1),
     }
 
 
-PIPE, LOAD = load_pipeline()
+PIPE, TRANSFORMERS, LOAD = load_pipeline()
 GPU = torch.cuda.get_device_name(0)
 COLD = {'pending': True}
 print(f'[qwen-image] ready on {GPU}: {LOAD}', flush=True)
@@ -173,19 +182,26 @@ def handler(job):
     except BadRequest as error:
         return {'error': f'bad request: {error}'}
     started = time.time()
+    precision = 'fp8' if TRANSFORMERS['fp8'] is not None and not request['references'] else 'bf16'
+    PIPE.transformer = TRANSFORMERS[precision]
     generator = torch.Generator(device='cuda').manual_seed(request['seed'])
     # no_grad, not inference_mode: torchao's FP8 tensors cannot take inference tensors.
-    with torch.no_grad():
-        image = PIPE(
-            prompt=request['prompt'],
-            image=request['references'] or None,
-            width=request['width'],
-            height=request['height'],
-            num_inference_steps=request['steps'],
-            generator=generator,
-            # Width and height are explicit, so this sizes the condition images only.
-            output_resolution=request['reference_resolution'],
-        ).images[0]
+    try:
+        with torch.no_grad():
+            image = PIPE(
+                prompt=request['prompt'],
+                image=request['references'] or None,
+                width=request['width'],
+                height=request['height'],
+                num_inference_steps=request['steps'],
+                generator=generator,
+                # Width and height are explicit, so this sizes the condition images only.
+                output_resolution=request['reference_resolution'],
+            ).images[0]
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        refs = len(request['references'])
+        return {'error': f"out of GPU memory at {request['width']}x{request['height']} with {refs} reference(s) on {GPU}"}
     generate_seconds = time.time() - started
     buffer = io.BytesIO()
     image.convert('RGB').save(buffer, format='JPEG', quality=request['quality'], optimize=True)
@@ -206,6 +222,8 @@ def handler(job):
         },
         'gpu': GPU,
         'placement': LOAD['placement'],
+        'precision': precision,
+        'freeVramGb': LOAD['freeVramGb'],
         'model': {'repo': MODEL_REPO, 'revision': LOAD['revision'], 'source': LOAD['source']},
     }
 
