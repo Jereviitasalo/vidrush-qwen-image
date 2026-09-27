@@ -42,7 +42,9 @@ RESIDENT_MIN_VRAM_GB = 40
 # plates on Ada/Hopper/Blackwell tensor cores, ~1.4x faster at the same look.
 # Condition images come out posterized under FP8, so any job with references
 # runs on the bf16 transformer. Ampere has no FP8 and stays bf16 throughout.
-# QWEN_FP8=0 turns the FP8 copy off.
+# Two transformers and a bf16 text encoder do not fit 48 GB, so the text
+# encoder (17.5 GB, one forward per plate) keeps FP8 weights with bf16
+# activations. QWEN_FP8=0 turns both off.
 FP8 = os.environ.get('QWEN_FP8', '1') == '1'
 
 MAX_REFERENCES = 10
@@ -66,14 +68,16 @@ def snapshot_path():
     return snapshot_download(MODEL_REPO, revision=MODEL_REVISION), 'download'
 
 
-def fp8_transformer(path):
-    """A second, FP8 copy of the transformer, quantized layer by layer onto the GPU; None when the card or torchao cannot."""
+def fp8_transformer(pipe, path):
+    """FP8 text-encoder weights, then a second FP8 copy of the transformer quantized layer by layer onto the GPU; None when the card or torchao cannot."""
     if not FP8 or torch.cuda.get_device_capability(0) < (8, 9):
         return None
     try:
         from diffusers import QwenImage21Transformer2DModel
-        from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, PerRow, quantize_
+        from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, Float8WeightOnlyConfig, PerRow, quantize_
 
+        quantize_(pipe.text_encoder, Float8WeightOnlyConfig())
+        torch.cuda.empty_cache()
         model = QwenImage21Transformer2DModel.from_pretrained(path, subfolder='transformer', dtype=torch.bfloat16)
         quantize_(model, Float8DynamicActivationFloat8WeightConfig(granularity=PerRow()), device='cuda')
         return model.to('cuda').eval()
@@ -93,7 +97,7 @@ def load_pipeline():
     fp8 = None
     if vram_gb >= RESIDENT_MIN_VRAM_GB:
         pipe.to('cuda')
-        fp8 = fp8_transformer(path)
+        fp8 = fp8_transformer(pipe, path)
         placement = 'resident'
     else:
         pipe.enable_model_cpu_offload()
