@@ -11,7 +11,10 @@ Request (`input`):
     prompt      str, 1-4000 chars
     width       int, multiple of 32, 256-2048   (default 1344)
     height      int, multiple of 32, 256-2048   (default 768)
-    steps       int, 8-60                        (default 40, Qwen's value)
+    variant     'base' | 'viggle-6' | 'pruna-8'  (default QWEN_VARIANT, else 'base')
+                base is the full model; the others fuse a step-distilled LoRA
+                and run its fixed sigma schedule, so they ignore `steps`.
+    steps       int, 8-60                        (default 40, Qwen's value; base only)
     seed        int | null
     references  [base64 image], 0-10: condition images, read in order
     reference_resolution  int, 256-1024 (default 512): side of the square
@@ -24,6 +27,7 @@ Reply: the JPEG as base64 plus timings and the GPU, so the app can price the
 job from RunPod's execution time.
 """
 import base64
+import gc
 import io
 import os
 import random
@@ -43,6 +47,32 @@ RESIDENT_MIN_VRAM_GB = 40
 # (a posterized copy of the reference comes from reusing the reference's own
 # seed, not from FP8). Ampere has no FP8 and stays bf16. QWEN_FP8=0 turns it off.
 FP8 = os.environ.get('QWEN_FP8', '1') == '1'
+
+# Step-distilled LoRAs (DMD students of the 40-step model, no CFG). The files
+# are baked into the image at LORA_DIR by the Dockerfile; a local run
+# downloads the pinned revision instead. One variant is resident at a time:
+# switching reloads the base transformer from the snapshot, fuses the LoRA
+# into it and re-quantizes, ~15-30 s, so an endpoint should stick to one.
+LORA_DIR = Path(os.environ.get('QWEN_LORA_DIR', '/models/lora'))
+VARIANTS = {
+    'base': None,
+    'viggle-6': {
+        'repo': 'Viggle/Qwen-Image-2.1-viggle-turbo',
+        'revision': 'bb26a0f38e5fe6c124aaccc9187a87eed5d9ed13',
+        'file': 'Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors',
+        'sigmas': [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25],
+        # Viggle ships the base scheduler without the terminal shift.
+        'scheduler': {'shift_terminal': None},
+    },
+    'pruna-8': {
+        'repo': 'PrunaAI/Pruna-Qwen-Image-2.1',
+        'revision': '113e63bb993001b3411eb3470b84fc444040cd7e',
+        'file': 'p_qwen_image_2.1_8step_v0.1.safetensors',
+        'sigmas': [1.0, 14 / 15, 6 / 7, 10 / 13, 2 / 3, 6 / 11, 0.4, 2 / 9],
+        'scheduler': {'use_dynamic_shifting': False, 'shift': 1.0, 'shift_terminal': None},
+    },
+}
+DEFAULT_VARIANT = os.environ.get('QWEN_VARIANT', 'base')
 
 MAX_REFERENCES = 10
 MAX_PIXELS = 4_194_304  # 2048 x 2048
@@ -101,18 +131,64 @@ def load_pipeline():
         'placement': placement,
         'precision': precision,
         'revision': Path(path).name,
+        'path': path,
         'freeVramGb': round(torch.cuda.mem_get_info()[0] / 1024**3, 1),
     }
 
 
-PIPE, LOAD = load_pipeline()
-GPU = torch.cuda.get_device_name(0)
-COLD = {'pending': True}
-print(f'[qwen-image] ready on {GPU}: {LOAD}', flush=True)
+def lora_file(spec):
+    baked = LORA_DIR / spec['file']
+    if baked.is_file():
+        return str(baked)
+    from huggingface_hub import hf_hub_download
+    print(f"[qwen-image] {spec['file']} not baked in; downloading", flush=True)
+    return hf_hub_download(spec['repo'], spec['file'], revision=spec['revision'])
+
+
+def use_variant(name):
+    """Make `name` the resident transformer and scheduler; returns the seconds it took (0 when already resident)."""
+    if STATE['variant'] == name:
+        return 0.0
+    if LOAD['placement'] != 'resident':
+        raise BadRequest('LoRA variants need a GPU with at least 40 GB')
+    from diffusers import FlowMatchEulerDiscreteScheduler, QwenImage21Transformer2DModel
+
+    started = time.time()
+    STATE['variant'] = None  # a swap that fails half way is retried by the next job
+    transformer = QwenImage21Transformer2DModel.from_pretrained(LOAD['path'], subfolder='transformer', dtype=torch.bfloat16)
+    # Drop the resident (quantized, maybe LoRA-fused) transformer before the new one reaches the GPU.
+    PIPE.transformer = transformer
+    gc.collect()
+    torch.cuda.empty_cache()
+    transformer.to('cuda')
+    spec = VARIANTS[name]
+    if spec:
+        path = Path(lora_file(spec))
+        PIPE.load_lora_weights(str(path.parent), weight_name=path.name, adapter_name=name)
+        PIPE.fuse_lora(lora_scale=1.0, adapter_names=[name])
+        PIPE.unload_lora_weights()
+    STATE['precision'] = to_fp8(PIPE)
+    PIPE.scheduler = FlowMatchEulerDiscreteScheduler.from_config(BASE_SCHEDULER, **(spec or {}).get('scheduler', {}))
+    gc.collect()
+    torch.cuda.empty_cache()
+    STATE['variant'] = name
+    seconds = round(time.time() - started, 2)
+    print(f'[qwen-image] variant {name} ready in {seconds}s', flush=True)
+    return seconds
 
 
 class BadRequest(ValueError):
     pass
+
+
+PIPE, LOAD = load_pipeline()
+BASE_SCHEDULER = dict(PIPE.scheduler.config)
+STATE = {'variant': 'base', 'precision': LOAD['precision']}
+if DEFAULT_VARIANT != 'base':
+    LOAD['loadSeconds'] = round(LOAD['loadSeconds'] + use_variant(DEFAULT_VARIANT), 2)
+GPU = torch.cuda.get_device_name(0)
+COLD = {'pending': True}
+print(f'[qwen-image] ready on {GPU} with {STATE["variant"]}: {LOAD}', flush=True)
 
 
 def int_field(payload, key, default, low, high, multiple=1):
@@ -158,6 +234,9 @@ def parse(payload):
         seed = random.randrange(2**31)
     elif isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**63:
         raise BadRequest('seed must be a non-negative integer or null')
+    variant = payload.get('variant', DEFAULT_VARIANT)
+    if variant not in VARIANTS:
+        raise BadRequest(f"variant must be one of {', '.join(VARIANTS)}")
     references = payload.get('references') or []
     if not isinstance(references, list) or len(references) > MAX_REFERENCES:
         raise BadRequest(f'references must be a list of at most {MAX_REFERENCES} images')
@@ -165,7 +244,8 @@ def parse(payload):
         'prompt': prompt.strip(),
         'width': width,
         'height': height,
-        'steps': int_field(payload, 'steps', 40, 8, 60),
+        'variant': variant,
+        'steps': len(VARIANTS[variant]['sigmas']) if VARIANTS[variant] else int_field(payload, 'steps', 40, 8, 60),
         'seed': seed,
         'references': [decode_reference(i, value) for i, value in enumerate(references)],
         'quality': int_field(payload, 'quality', 92, 70, 100),
@@ -178,6 +258,11 @@ def handler(job):
         request = parse(job.get('input'))
     except BadRequest as error:
         return {'error': f'bad request: {error}'}
+    try:
+        swap_seconds = use_variant(request['variant'])
+    except BadRequest as error:
+        return {'error': f'bad request: {error}'}
+    spec = VARIANTS[request['variant']]
     started = time.time()
     generator = torch.Generator(device='cuda').manual_seed(request['seed'])
     # no_grad, not inference_mode: torchao's FP8 tensors cannot take inference tensors.
@@ -189,6 +274,7 @@ def handler(job):
                 width=request['width'],
                 height=request['height'],
                 num_inference_steps=request['steps'],
+                sigmas=spec['sigmas'] if spec else None,
                 generator=generator,
                 # Width and height are explicit, so this sizes the condition images only.
                 output_resolution=request['reference_resolution'],
@@ -209,15 +295,17 @@ def handler(job):
         'height': image.height,
         'seed': request['seed'],
         'steps': request['steps'],
+        'variant': request['variant'],
         'references': len(request['references']),
         'timings': {
             'loadSeconds': LOAD['loadSeconds'],
             'coldStart': cold,
+            'swapSeconds': swap_seconds,
             'generateSeconds': round(generate_seconds, 2),
         },
         'gpu': GPU,
         'placement': LOAD['placement'],
-        'precision': LOAD['precision'],
+        'precision': STATE['precision'],
         'freeVramGb': LOAD['freeVramGb'],
         'model': {'repo': MODEL_REPO, 'revision': LOAD['revision'], 'source': LOAD['source']},
     }
