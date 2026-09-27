@@ -26,7 +26,7 @@ The reply holds `image` (base64 JPEG), `width`, `height`, `seed`, `variant`, `ti
 | `viggle-6` | 6 | [Viggle/Qwen-Image-2.1-viggle-turbo](https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo) v0.2.1 r256 |
 | `pruna-8` | 8 | [PrunaAI/Pruna-Qwen-Image-2.1](https://huggingface.co/PrunaAI/Pruna-Qwen-Image-2.1) v0.1 |
 
-One variant is resident at a time. A job for another variant first reloads the base transformer, fuses that LoRA and re-quantizes it (`swapSeconds`, billed), so an endpoint should stick to one. The `QWEN_VARIANT` env var sets the variant loaded at start and the default for jobs that do not name one.
+The first job for a variant builds it: the worker reloads the base transformer, fuses that LoRA and quantizes it (`swapSeconds`, ~5-12 s, billed). Built variants stay on the GPU while there is room (base and one LoRA variant fit a 48 GB card in FP8), so switching back is free. `QWEN_PRELOAD` (comma list, e.g. `viggle-6`) builds variants at start; `QWEN_VARIANT` sets the default for jobs that do not name one.
 
 ## Release
 

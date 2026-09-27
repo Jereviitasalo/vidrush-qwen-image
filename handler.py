@@ -51,9 +51,10 @@ FP8 = os.environ.get('QWEN_FP8', '1') == '1'
 
 # Step-distilled LoRAs (DMD students of the 40-step model, no CFG). The files
 # are baked into the image at LORA_DIR by the Dockerfile; a local run
-# downloads the pinned revision instead. One variant is resident at a time:
-# switching reloads the base transformer from the snapshot, fuses the LoRA
-# into it and re-quantizes, ~15-30 s, so an endpoint should stick to one.
+# downloads the pinned revision instead. Building a variant reloads the base
+# transformer from the snapshot, fuses the LoRA and quantizes (~5-12 s); the
+# result stays on the GPU while there is room, so switching back is free.
+# QWEN_PRELOAD (comma list) builds variants at start.
 LORA_DIR = Path(os.environ.get('QWEN_LORA_DIR', '/models/lora'))
 VARIANTS = {
     'base': None,
@@ -74,6 +75,9 @@ VARIANTS = {
     },
 }
 DEFAULT_VARIANT = os.environ.get('QWEN_VARIANT', 'base')
+# Free VRAM needed to build another variant beside the resident ones: a bf16
+# transformer (14.2 GB) and its LoRA while it is fused, plus room to run.
+BUILD_HEADROOM_GB = 19
 
 MAX_REFERENCES = 10
 MAX_PIXELS = 4_194_304  # 2048 x 2048
@@ -244,7 +248,12 @@ def stage_timings():
 
 
 def use_variant(name):
-    """Make `name` the resident transformer and scheduler; returns the seconds it took (0 when already resident)."""
+    """Make `name` the active transformer and scheduler; returns the seconds it took (0 when already active).
+
+    A variant built once stays on the GPU while there is room (two FP8
+    transformers fit a 48 GB card next to the text encoder), so a video that
+    mixes base and viggle-6 plates switches by reference, not by reloading.
+    """
     if STATE['variant'] == name:
         return 0.0
     if LOAD['placement'] != 'resident':
@@ -252,26 +261,32 @@ def use_variant(name):
     from diffusers import FlowMatchEulerDiscreteScheduler, QwenImage21Transformer2DModel
 
     started = time.time()
-    STATE['variant'] = None  # a swap that fails half way is retried by the next job
-    transformer = QwenImage21Transformer2DModel.from_pretrained(LOAD['path'], subfolder='transformer', dtype=torch.bfloat16)
-    # Drop the resident (quantized, maybe LoRA-fused) transformer before the new one reaches the GPU.
-    PIPE.transformer = transformer
-    gc.collect()
-    torch.cuda.empty_cache()
-    transformer.to('cuda')
     spec = VARIANTS[name]
-    if spec:
-        load_lora(name, Path(lora_file(spec)))
-        PIPE.fuse_lora(lora_scale=1.0, adapter_names=[name])
-        PIPE.unload_lora_weights()
-    STATE['precision'] = to_fp8(PIPE)
+    STATE['variant'] = None  # a swap that fails half way is retried by the next job
+    if name not in RESIDENT:
+        transformer = QwenImage21Transformer2DModel.from_pretrained(LOAD['path'], subfolder='transformer', dtype=torch.bfloat16)
+        free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+        if free_gb < BUILD_HEADROOM_GB:
+            # No room for a bf16 copy beside the others (Ampere keeps bf16): keep one variant only.
+            RESIDENT.clear()
+        PIPE.transformer = transformer
+        gc.collect()
+        torch.cuda.empty_cache()
+        transformer.to('cuda')
+        if spec:
+            load_lora(name, Path(lora_file(spec)))
+            PIPE.fuse_lora(lora_scale=1.0, adapter_names=[name])
+            PIPE.unload_lora_weights()
+        RESIDENT[name] = (transformer, to_fp8(PIPE))
+        gc.collect()
+        torch.cuda.empty_cache()
+        instrument()
+    PIPE.transformer, STATE['precision'] = RESIDENT[name]
     PIPE.scheduler = FlowMatchEulerDiscreteScheduler.from_config(BASE_SCHEDULER, **(spec or {}).get('scheduler', {}))
-    gc.collect()
-    torch.cuda.empty_cache()
-    instrument()
     STATE['variant'] = name
     seconds = round(time.time() - started, 2)
-    print(f'[qwen-image] variant {name} ready in {seconds}s', flush=True)
+    print(f"[qwen-image] variant {name} active in {seconds}s (resident: {', '.join(RESIDENT)}; "
+          f"{torch.cuda.mem_get_info()[0] / 1024**3:.1f} GB free)", flush=True)
     return seconds
 
 
@@ -282,10 +297,16 @@ class BadRequest(ValueError):
 PIPE, LOAD = load_pipeline()
 BASE_SCHEDULER = dict(PIPE.scheduler.config)
 STATE = {'variant': 'base', 'precision': LOAD['precision']}
+RESIDENT = {'base': (PIPE.transformer, LOAD['precision'])}
 STAGES = {}
 instrument()
-if DEFAULT_VARIANT != 'base':
+# Variants to build at start, beside base (the app mixes base and viggle-6).
+for preload in [v.strip() for v in os.environ.get('QWEN_PRELOAD', '').split(',') if v.strip()]:
+    if preload in VARIANTS and LOAD['placement'] == 'resident':
+        LOAD['loadSeconds'] = round(LOAD['loadSeconds'] + use_variant(preload), 2)
+if DEFAULT_VARIANT != STATE['variant'] and DEFAULT_VARIANT in VARIANTS:
     LOAD['loadSeconds'] = round(LOAD['loadSeconds'] + use_variant(DEFAULT_VARIANT), 2)
+LOAD['freeVramGb'] = round(torch.cuda.mem_get_info()[0] / 1024**3, 1)
 GPU = torch.cuda.get_device_name(0)
 COLD = {'pending': True}
 print(f'[qwen-image] ready on {GPU} with {STATE["variant"]}: {LOAD}', flush=True)
